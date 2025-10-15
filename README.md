@@ -5,7 +5,7 @@
     ║     DNS Amplification     ║
     ╚═══════════════════════════╝
 
-    Script for amplification DOS attack
+    Script for amplification DOS/DDOS attack
 
 # Для 1 ГБ трафика к жертве:
 ```bash
